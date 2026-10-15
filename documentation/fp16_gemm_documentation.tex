@@ -1,0 +1,231 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{amsmath}
+\usepackage{parskip}
+\usepackage{enumitem}
+
+\definecolor{codebg}{rgb}{0.95,0.95,0.95}
+\lstset{
+    basicstyle=\ttfamily\small,
+    backgroundcolor=\color{codebg},
+    breaklines=true,
+    frame=single,
+    columns=fullflexible,
+    language=C++,
+    showstringspaces=false,
+}
+
+\title{FP16 GEMM Kernel Optimization:\\the \texttt{wide\_bigreg\_sq} L2 Sector Excess Investigation}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\noindent
+\textbf{Kernel under study:} \texttt{gemm\_fp16\_mma\_ptx\_wide\_bigreg\_sq\_kernel}\\
+\textbf{File:} \texttt{src/kernels/cuda/matrix/mm\_cuda\_kernels.cu}\\
+\textbf{Hardware:} NVIDIA A100 (sm\_80), Purdue Gilbreth cluster\\
+\textbf{Project constraint:} hand-tuned kernels must approach CUTLASS/cuBLAS performance \textbf{without} depending on CUTLASS as a library at build time.
+
+\section{Background}
+
+\texttt{wide\_bigreg\_sq} is one of several hand-written FP16 GEMM kernels in this codebase built to compete with CUTLASS's own \texttt{device::Gemm} and cuBLAS's \texttt{Hgemm}, without linking against CUTLASS. Profiling with \texttt{ncu} (Nsight Compute) surfaced a persistent finding: the kernel's A-tile load --- \texttt{load\_tile\_async}'s \texttt{cp.async} (\texttt{LDGSTS.E.BYPASS.LTC128B.128}) instructions --- shows a \textbf{real, hardware-confirmed L2 sector excess}, flagged by \texttt{ncu}'s \texttt{UncoalescedGlobalAccess} rule:
+
+\begin{quote}
+\textit{``This workload has uncoalesced global accesses resulting in a total of 134{,}217{,}728 excessive sectors (25\% of the total 545{,}193{,}680 sectors).''} (N = 8192)
+\end{quote}
+
+This is not a theoretical estimate --- it is measured against a real hardware counter (\texttt{lts\_\_t\_sectors\_srcunit\_tex\_op\_read.sum}), compared to \texttt{ncu}'s own computed ideal. Real CUTLASS's equivalent load, on the identical GEMM, shows \textbf{0\% excess}. Address arithmetic in our kernel was independently re-derived and confirmed correct --- the warp's 32 lanes form a textbook-ideal, 512-byte-aligned contiguous run. The excess is a genuine, physical effect, not a bug in the addressing math.
+
+Two additional established facts framed the whole investigation:
+
+\begin{enumerate}
+\item \textbf{Triggered by concurrency, not addresses.} A single active warp (1 warp/1 block) shows 0\% excess. Two, four, or eight concurrently-active warps all show the identical $\sim$1.5$\times$/25\% excess --- the effect turns on completely between 1 and 2 warps and does not scale further with warp count.
+\item \textbf{The naive fix is a net loss.} Replacing \texttt{cp.async} with a plain, synchronous vectorized \texttt{LDG.128}+\texttt{STS.128} (byte-identical addressing) eliminates the excess entirely (0\% at any warp count) but causes a \textbf{35--40\% throughput regression} (measured: 131{,}647--134{,}696 GFlop/s vs.\ the confirmed 205{,}000--220{,}427 GFlop/s baseline at N=8192). This kernel is compute/tensor-core-bound ($\sim$70\% SM throughput from HMMA), so \texttt{cp.async}'s real value is hiding memory latency behind other in-flight work (MMA, B's load) --- not reducing bytes moved. A synchronous load exposes that latency directly into the instruction stream, which costs far more than the sector waste it removes. This fix was tried and reverted; \texttt{cp.async} was kept \textbf{deliberately}.
+\end{enumerate}
+
+Given (2), the goal shifted from ``eliminate \texttt{cp.async}'' to ``understand and, if possible, eliminate the root cause while keeping \texttt{cp.async}'s async-overlap benefit intact.''
+
+\section{Investigation Timeline}
+
+The investigation proceeded in three broad phases, spanning many independently-motivated, hardware-measured hypotheses. Numbers below are the actual measured values at each step, not estimates.
+
+\subsection{Phase 1 --- Characterizing the effect (prior sessions)}
+
+\begin{itemize}
+\item Ruled out the epilogue's \texttt{beta*C} read (excess is identical whether or not that code path executes).
+\item Ruled out \texttt{ld\_a}'s power-of-two-ness (padding \texttt{ld\_a} to a non-power-of-two value made no difference).
+\item Ruled out warp-separation distance (doesn't correlate with excess magnitude).
+\item Confirmed via a byte-identical plain-load test that the effect is specific to \texttt{LDGSTS.BYPASS} (cache-bypass \texttt{cp.async}), not a general ``many warps, different addresses'' phenomenon.
+\item Traced why real CUTLASS avoids this by tracing \texttt{cutlass::gemm::device::Gemm}'s internal A$\leftrightarrow$B swap-and-transpose for \texttt{LayoutC=ColumnMajor} outputs, and wired up CUTLASS's \textbf{real} \texttt{PredicatedTileAccessIterator} class directly in an isolated repro (\texttt{a\_load\_repro\_cutlass\_iterator.cu}). This is the first configuration found that reproduced CUTLASS's clean (0\% excess) behavior.
+\item An initial $\sim$17-round ablation campaign (matching CUTLASS's address formula, predication style, immediate-offset addressing, synthetic and then genuine instruction interleaving, batched-bitmask predicate computation, and an exact source-verified match of the class's ``compute predicates once, never again'' steady-state behavior) \textbf{failed to reproduce the clean result} in hand-written code. Only the literal, complete CUTLASS iterator class was clean; every hand-rolled equivalent, however closely matched, showed the same 1.5$\times$ excess.
+\end{itemize}
+
+\subsection{Phase 2 --- Exhaustive ablation of the real class, and ruling out timing (this session, part 1)}
+
+Rather than replicate the class, this phase modified the \textbf{real, unmodified CUTLASS header} in place (via a local include-path override), trivializing one piece of its internals at a time while keeping it as the vehicle:
+
+\begin{itemize}
+\item Trivialized \texttt{compute\_predicates\_()} to constant-true bitmasks --- \textbf{still clean}.
+\item Trivialized \texttt{set\_predicates()}'s residue-size/extent arithmetic --- \textbf{still clean}.
+\item Replaced \texttt{ThreadMap::initial\_offset(thread\_id)} with hand-inlined scalar arithmetic producing the identical address --- \textbf{still clean}.
+\item Moved that arithmetic into a \textbf{free function} (not a class method) in the same translation unit --- \textbf{still clean}. This proved decisively that ``being a class method'' was never the discriminator.
+\end{itemize}
+
+With every internal computation gutted and even the class/free-function boundary eliminated, only the literal CUTLASS class --- regardless of how hollowed-out --- stayed clean. This pointed toward something at the \emph{compiled-instruction-scheduling} level, not anything expressible in source.
+
+SASS diffing found the clean kernel's four unrolled \texttt{LDGSTS} per tile were \textbf{not} fully back-to-back (\texttt{ptxas} interleaved a few unrelated ALU instructions between them), while every hand-rolled equivalent compiled to four fully-adjacent \texttt{LDGSTS}. This ``instruction adjacency'' hypothesis was then tested directly and \textbf{decisively falsified}:
+
+\begin{itemize}
+\item \textbf{Elapsed-time spacing} (\texttt{\_\_nanosleep()}, both uniform-per-warp and staggered-between-warps, 0--300ns): \textbf{zero effect} at every magnitude.
+\item \textbf{Forced, unhoistable instruction-level interleaving} (a genuine data-dependency chain feeding each \texttt{LDGSTS}'s own predicate register, deep enough that \texttt{ptxas} couldn't precompute it ahead of time): produced real SASS-level gaps between the \texttt{LDGSTS}, in one case matching or exceeding the real kernel's own gap pattern --- \textbf{still excess, completely unchanged}, in every configuration (0 gaps, 1 gap, 3 gaps).
+\end{itemize}
+
+Conclusion: SASS-level instruction adjacency was a real, consistent \emph{correlate} across dozens of variants, but proven \textbf{non-causal} once directly, controllably tested.
+
+\subsection{Phase 3 --- Finding a real, reproducible mechanism in isolation}
+
+A sharper question was then asked: \textbf{is this really about the iterator at all}, or could file/translation-unit-level effects, or something else entirely, be responsible?
+
+\begin{itemize}
+\item A fully hand-written kernel with \textbf{zero} \texttt{Iterator} class usage, placed in the \emph{same file} as the real class-based kernels, came back \textbf{clean} --- the first hand-written kernel in the whole investigation to do so. Moved into a brand-new, minimal, single-kernel file (no CUTLASS iterator headers at all): \textbf{still clean}. This definitively ruled out the iterator class, and the file/TU, as the cause.
+\item Careful line-by-line diffing against the file's other (excess-showing) hand-written variants isolated the actual remaining difference: the \textbf{shared-memory destination indexing stride} between the four unrolled accesses. Clean kernels used a large stride (2048 elements $= 2^{11}$, a clean power of two); excess-showing kernels used a small stride (64 elements). Switching \emph{only} this --- reverting every other change back to the original excess-showing form (\texttt{const} pointer, chained predicate, narrow 32-bit multiply) --- flipped the result to clean on its own.
+\item Testing the real kernel's \emph{actual} stride (2112 elements $= 8\times264$, \textbf{not} a power of two) in isolation: \textbf{still clean}. Power-of-two-ness was not the variable; raw magnitude, or perhaps just ``large enough,'' was.
+\item Testing at the real kernel's actual warp count (8 warps instead of 2), with the real stride: \textbf{still clean} (confirmed via \texttt{ncu}'s own theoretical-ideal metric, not inference).
+\item Adding a second, concurrently-issued load stream (``B''), with a \textbf{simplified, non-faithful} layout: introduced real excess ($\sim$14.3\%) for the first time. This appeared to be a breakthrough, but replacing the simplified B layout with the \emph{exact} real crosswise formula (\texttt{gemm\_fp16\_widebigregsq\_crosswise\_bs\_idx}, verified line-for-line against the source) made the excess \textbf{disappear again} --- the earlier ``breakthrough'' was an artifact of an incorrect B implementation, not a real finding.
+\item Extending the repro further to match the real kernel's actual A thread-mapping (\texttt{a\_group/a\_kk0/a\_i}, distinct from the CUTLASS-style mapping used in every earlier ``clean'' test in this investigation) \textbf{and} the real 3-stage rotating shared-memory buffer (\texttt{buf = t \% 3}) reproduced the excess at \textbf{exactly 25\%} --- matching the real kernel's own documented figure to within measurement noise.
+\item Systematically isolating which of those two changes mattered: the \textbf{real A-tile thread mapping alone} --- no B, no buffer rotation --- reproduced the identical \emph{absolute} excess sector count (8192 sectors) as the full combination. Adding B and/or rotation only diluted the \emph{percentage} (more clean traffic sharing the same denominator); it never caused or fixed anything on its own.
+\end{itemize}
+
+\textbf{Conclusion of the isolated investigation:} the root cause is \texttt{load\_tile\_async}'s A-tile thread-to-address mapping. The production mapping (\texttt{a\_group = tid \% 32, a\_kk0 = tid / 32, a\_i = a\_group * 8} --- each thread covers 4 \emph{consecutive} K values at one \emph{fixed} M position) causes the excess. The CUTLASS-style mapping (\texttt{warp\_id}/\texttt{lane\_id} decomposition --- each thread covers \emph{one fixed} K value across 4 \emph{different} M positions) does not, in every isolated configuration tested: alone, with B, with the 3-stage buffer rotation, at 2 warps, and at 8 warps.
+
+\section{The Attempted Fix}
+
+Based on the isolated finding, \texttt{load\_tile\_async}'s A-load (both the ``safe'' and boundary-checked branches) was rewritten to use the CUTLASS-style mapping:
+
+\textbf{Before} (each thread: 4 consecutive K values, 1 fixed M position):
+\begin{lstlisting}
+int a_group = tid % kAGroups;      // kAGroups = 32
+int a_kk0   = tid / kAGroups;
+int a_i     = a_group * 8;
+// ... 4 reps, kk = a_kk0 + rep*kAKkStep, address advances by a_ld_step per rep
+\end{lstlisting}
+
+\textbf{After} (each thread: 1 fixed K value, 4 different M positions):
+\begin{lstlisting}
+int a_warp_id  = tid / 32;
+int a_lane_id  = tid % 32;
+int a_k_lane   = a_lane_id / 8;
+int a_m_lane   = a_lane_id % 8;
+int a_kk       = 4 * a_warp_id + a_k_lane;   // FIXED per thread
+int a_m_lane_i = a_m_lane * 8;
+// ... 4 reps, M position = a_m_lane_i + rep*64, address advances by 64 elements per rep
+\end{lstlisting}
+
+This is safe to change in isolation because the downstream consumer, \texttt{load\_a\_frag} (the \texttt{ldmatrix}-based MMA fragment loader), reads shared memory purely by logical \texttt{(buf, kk, m)} coordinates via \texttt{gemm\_fp16\_widebigreg\_as\_idx(buf, kk, i) = (buf*BK + kk)*BMPad + i} --- \textbf{never by which thread wrote a given slot}. Any mapping that covers the full \texttt{(kk} $\in [0, BK)$\texttt{, m} $\in [0, BM)$\texttt{)} space exactly once with correct source data is interchangeable from the reader's point of view. This is also why the fix, unlike the earlier plain-load attempt, does \textbf{not} touch \texttt{cp.async} at all --- only \emph{which thread reads which address} changes, so the async-overlap benefit is untouched.
+
+As a byproduct of this change, \texttt{a\_ld\_step} and \texttt{kAKkStep} became dead in this kernel's scope and were removed; a stale comment referencing \texttt{a\_ld\_step} was updated accordingly.
+
+\section{Verification}
+
+\subsection{Correctness}
+
+\texttt{benchmarks/kernels/cuda/matrix/verify\_mm\_fp16\_gemm} (compares against a CPU reference across $\sim$50 kernels and multiple problem sizes) was run after the fix. Every \texttt{gemm\_fp16\_mma\_ptx\_wide\_bigreg\_sq} case --- 8 problem sizes, both \texttt{beta=0} and \texttt{beta}$\neq$\texttt{0} --- reported \texttt{OK}, with error magnitudes \textbf{identical} to the untouched sibling kernel (\texttt{gemm\_fp16\_mma\_ptx\_wide\_bigreg}), e.g.:
+
+\begin{lstlisting}[language={}]
+gemm_fp16_mma_ptx_wide_bigreg square     max_abs_err=0.0078125 max_rel_err=0.00292969 OK
+gemm_fp16_mma_ptx_wide_bigreg_sq square  max_abs_err=0.0078125 max_rel_err=0.00292969 OK
+\end{lstlisting}
+
+No failures were observed anywhere in the (very long) suite before it was interrupted by an unrelated, much later, slow kernel.
+
+\subsection{Performance}
+
+\textbf{Methodological note:} an initial before/after comparison was run directly from a development shell that, unnoticed at the time, was attached to the cluster's login node --- which carries an NVIDIA A30, not the A100 this whole investigation targets. That comparison was discarded once caught (\texttt{hostname}/\texttt{nvidia-smi} should always be checked before trusting any performance number on a shared cluster). All figures below were measured on an actual A100 compute node.
+
+A controlled before/after comparison was done using a separate \texttt{git worktree} checked out at the last pre-fix commit, built and benchmarked back-to-back with the current (fixed) working tree, using \texttt{scripts/wide\_bigreg\_family\_vs\_cutlass\_ref.sh} across the same size sweep used by \texttt{verify\_mm\_fp16\_gemm}. Figures below are \texttt{wide\_bigreg\_sq}'s own GFlop/s, same binary pair, same run-to-run conditions:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrr}
+\toprule
+N & BEFORE (pre-fix) & AFTER (with fix) & $\Delta$ \\
+\midrule
+1024  & 31{,}161.2  & 40{,}060.2  & \textbf{+28.6\%} \\
+2048  & 81{,}403.3  & 101{,}618.5 & \textbf{+24.8\%} \\
+4096  & 146{,}621.9 & 186{,}880.7 & \textbf{+27.5\%} \\
+8192  & 189{,}532.9 & 187{,}337.2 & $-$1.2\% \\
+16384 & 192{,}491.5 & 188{,}146.8 & $-$2.3\% \\
+32768 & 192{,}645.3 & 189{,}057.3 & $-$1.9\% \\
+65536 & 187{,}070.4 & 185{,}942.7 & $-$0.6\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The picture is coherent and consistent: \textbf{substantial, repeatable gains (25--28\%) at small-to-medium N (1024--4096)}, and \textbf{small, consistent dips (1--2\%, not scaling with size) at large N (8192--65536)}. The large-N dip is consistent with the finding in Section~5: the fix does not change the actual L2 sector excess at N=8192, so at the sizes where that excess dominates the kernel's behavior, the new A-mapping doesn't address the bottleneck and may add a small amount of overhead from the restructured addressing itself; at smaller N, other effects (occupancy, boundary-check proportion) let the new mapping help directly.
+
+A separate, useful side-finding from this comparison: \texttt{wide\_bigreg\_sq} is measurably slower than its untouched sibling \texttt{wide\_bigreg} specifically at N=2048 (roughly 16--18\% slower), but this gap is present \textbf{both before and after} the fix (BEFORE: 81{,}403.3 vs.\ 96{,}754.4; AFTER: 101{,}618.5 vs.\ 123{,}954.3) --- it is a pre-existing characteristic of \texttt{wide\_bigreg\_sq} at that size, unrelated to this fix, and out of scope for this investigation.
+
+Absolute GFlop/s figures still vary somewhat run-to-run on this shared cluster GPU (e.g.\ \texttt{cublas}'s own reported throughput at N=8192 ranged from $\sim$272{,}000 to $\sim$282{,}000 across the runs used above), so relative, same-run comparisons remain the reliable signal, not any single absolute number in isolation.
+
+\section{The Critical, Currently-Unresolved Discrepancy}
+
+Direct \texttt{ncu} profiling of the real kernel, \textbf{with the fix applied}, shows the L2 sector excess is \textbf{completely unchanged}:
+
+\begin{quote}
+\textit{This workload has uncoalesced global accesses resulting in a total of 134217728 excessive sectors (25\% of the total 545193680 sectors).}
+\end{quote}
+
+This is the exact same figure documented before the fix. Per-instruction attribution (via \texttt{ncu --page source}) confirms this is not a measurement artifact:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrl}
+\toprule
+Address group & Excess/instr. & Executions/warp & Role (inferred from exec.\ count) \\
+\midrule
+\texttt{R166}/\texttt{R174} ($\times$4) & 33{,}292{,}288 & 4{,}161{,}536 ($=16384\times254$) & Main-loop call ($\sim$254 K-tiles, N=8192) \\
+\texttt{R10+0x42xx}/\texttt{R12} ($\times$4) & 131{,}072 & 16{,}384 ($=16384\times1$) & Priming call \#1 \\
+\texttt{R10+0x0xx}/\texttt{R16} ($\times$4) & 131{,}072 & 16{,}384 ($=16384\times1$) & Priming call \#2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+$33{,}292{,}288\times4 + 131{,}072\times8 = 134{,}217{,}728$ --- \textbf{exactly} the full excess. All twelve flagged instructions show the identical 4-step, 128-byte-stride pattern that the fix's new A-mapping produces (\texttt{rep*64} elements), appearing three times because \texttt{load\_tile\_async} is inlined separately at its three call sites (two priming, one main-loop). \textbf{100\% of the measured excess is still attributable to A's load}, using a mapping that was clean in \emph{every} isolated test built during this investigation --- including tests that matched the real B layout, the real 3-stage buffer rotation, and the real warp count.
+
+\textbf{This means something about the real kernel's full context --- not captured by any isolated repro in this investigation --- is responsible.} Every isolated test used a single threadblock (\texttt{grid\_y=1}); the real kernel launches $\sim$2048 blocks across all 108 SMs on the A100. GPU-wide, many-block memory-system contention is the leading untested candidate, since no repro in this investigation ever exercised it. MMA/tensor-core compute interleaved in the same loop, and the real kernel's much higher register/occupancy footprint (255 registers/thread vs.\ 19--32 in isolated tests), are the other two untested candidates.
+
+\section{Current State}
+
+\begin{itemize}
+\item The A-tile mapping fix \textbf{is applied} to \texttt{mm\_cuda\_kernels.cu}'s \texttt{load\_tile\_async} (used by \texttt{gemm\_fp16\_mma\_ptx\_wide\_bigreg\_sq\_kernel}).
+\item It is \textbf{verified correct} (matches CPU reference and the untouched sibling kernel's error profile exactly).
+\item On real A100 hardware, it delivers \textbf{substantial, repeatable gains (25--28\%) at N=1024--4096}, and \textbf{small, consistent dips (1--2\%) at N=8192--65536} --- no broad regression at any tested size.
+\item It \textbf{does not} eliminate the \texttt{ncu}-flagged L2 sector excess in the production kernel at N=8192 --- that finding, and its root cause in the \emph{full} kernel, remains open, and plausibly explains the small dip observed at large N.
+\item The mechanism is \textbf{fully and decisively understood and resolved} for every simplified, isolated repro built in this investigation (\texttt{benchmarks/kernels/cuda/matrix/a\_load\_repro*.cu} and related files) --- it does not transfer to the production kernel's full complexity, for reasons not yet identified.
+\end{itemize}
+
+The fix is a net positive on its own merits (correct, meaningfully faster at small-to-medium sizes, only a small cost at large sizes) independent of whether it resolves the original \texttt{ncu} finding, and there is no evidence it should be reverted.
+
+\section{What Needs to Be Tested Further}
+
+In priority order, based on what has \emph{never} been tested in this investigation:
+
+\begin{enumerate}
+\item \textbf{Real multi-block occupancy.} Build an isolated repro that launches a realistic grid (dozens to thousands of blocks across all SMs, matching the real kernel's $\sim$2048-block launch) instead of a single block, and re-run the same A-mapping-only and A+B+rotation comparisons at that scale. This is the single highest-value untested variable --- every prior isolated result in this investigation used \texttt{grid\_y=1}.
+\item \textbf{Genuine software-pipelining depth.} All isolated multi-stage tests issued-then-waited every tile (shallow depth); none tested real multi-tile-ahead prefetching (issuing tile \emph{t+2} while consuming tile \emph{t}, as the real kernel's priming/main-loop structure does).
+\item \textbf{MMA/tensor-core compute interleaved in the same loop.} Every isolated repro tested only the load instructions in isolation; none included \texttt{wmma}/\texttt{mma.sync} instructions sharing the loop body, warp scheduler, and instruction issue slots with the loads.
+\item \textbf{Realistic register pressure/occupancy.} The production kernel uses 255 registers/thread; isolated tests used 19--32. Whether high register pressure (and correspondingly low achieved occupancy) changes \texttt{ptxas}'s scheduling or the SM's memory-pipe behavior in a way that reintroduces the excess is untested.
+\item \textbf{Whether B or C (the epilogue write) independently contribute excess in the full kernel.} The per-instruction breakdown above shows 100\% of the \emph{currently measured} excess on A's instructions, but this only rules out B/C as \emph{additional} contributors under the current (fixed) A-mapping --- it does not establish whether they would show excess of their own under other conditions (e.g., higher occupancy).
+\item \textbf{Whether the fix's absolute throughput is stable across problem sizes}, not just N=8192 --- the correctness suite covers multiple sizes, but the performance comparison was only rigorously controlled at N=8192.
+\end{enumerate}
+
+If further investigation is undertaken, extending \texttt{a\_load\_repro\_isolated.cu}'s existing \texttt{kernel\_ab3\_iso} template (already parameterized by A-mapping and buffer-rotation choice) to also launch a realistic multi-block grid is the most direct next step, and would settle candidate (1) with the same rigor applied to every other variable in this investigation.
+
+\end{document}

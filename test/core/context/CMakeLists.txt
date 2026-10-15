@@ -1,0 +1,11 @@
+set(TOMOS_TEST_LIBS tomos_core tomos_cpu)
+if("${DEVICE_BACKEND}" STREQUAL "CUDA")
+    list(APPEND TOMOS_TEST_LIBS tomos_cuda)
+endif()
+
+add_executable(test_context test_context.cpp)
+target_link_libraries(test_context ${TOMOS_TEST_LIBS} GTest::gtest_main)
+if("${DEVICE_BACKEND}" STREQUAL "CUDA")
+    target_include_directories(test_context PRIVATE ${CUDA_INC})
+    target_link_libraries(test_context -L${CUDA_LIB} -lcudart)
+endif()

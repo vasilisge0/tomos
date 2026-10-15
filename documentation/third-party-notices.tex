@@ -1,0 +1,317 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{amsmath}
+\usepackage{parskip}
+\usepackage{enumitem}
+
+\definecolor{codebg}{rgb}{0.95,0.95,0.95}
+\lstset{
+    basicstyle=\ttfamily\small,
+    backgroundcolor=\color{codebg},
+    breaklines=true,
+    frame=single,
+    columns=fullflexible,
+    language=C++,
+    showstringspaces=false,
+}
+
+\newcommand{\field}[2]{\noindent\textbf{#1:} #2\\}
+
+\title{Third-Party Notices}
+\author{TOMOS}
+\date{\today}
+
+\sloppy
+\emergencystretch=3em
+
+\begin{document}
+\maketitle
+
+\noindent
+This document enumerates the third-party software referenced or
+incorporated in the development of TOMOS, for the purpose of
+license-compliance review. For a general overview of the project, see the
+project's \texttt{README.md}. The full, verbatim license text for every
+entry below that is genuinely redistributed (compiled into a binary TOMOS
+ships) is reproduced in the \texttt{licenses/} directory at the
+repository root.
+
+\section{Matrix Market I/O library (\texttt{mmio.c}/\texttt{mmio.h})}
+
+\field{License}{Public domain}
+\field{Author}{Roldan Pozo, NIST (\texttt{pozo@nist.gov}), Fri Aug 15 16:29:47 EDT 1997}
+\field{Source}{\url{http://math.nist.gov/MatrixMarket}}
+
+\noindent
+\textbf{Description:} Vendored directly into this repository as
+\texttt{src/io/mmio.c} and \texttt{src/io/mmio.h}, and compiled into
+\texttt{tomos\_core}. This library provides the \texttt{.mtx} file reading
+and writing functionality used throughout the project's benchmark and LSQR
+tooling. Unlike every other entry in this document, it consists of vendored
+source code residing within the repository, rather than a build-time fetch
+or a link-only dependency. Both files contain the original NIST copyright,
+permission, and warranty notice within their header comments.
+
+\section{NVIDIA CUDA Toolkit (cuBLAS, cuSPARSE, cuSOLVER, cuBLASLt, cuRAND, CUDA Runtime)}
+
+\field{License}{Proprietary; the NVIDIA CUDA Toolkit End User License Agreement (EULA). This is not an open-source license, and is neither BSD-3-Clause nor any OSI-approved license.}
+\field{Source}{Not applicable; the toolkit is closed-source and distributed only as the CUDA Toolkit (\url{https://developer.nvidia.com/cuda-toolkit}).}
+
+\noindent
+\textbf{Description:} TOMOS's CUDA kernels (\texttt{tomos\_cuda}) and
+solver code call directly into \texttt{cublas}, \texttt{cusparse},
+\texttt{cusolver}, \texttt{cublasLt}, \texttt{curand}, \texttt{cudart}, and
+\texttt{cudadevrt}. No component of the CUDA Toolkit is vendored or
+redistributed; TOMOS links against it at build time only, referencing
+whichever CUDA Toolkit installation is present on the end user's own
+system (\texttt{CUDA\_HOME}). Anyone building or running TOMOS must
+separately install the CUDA Toolkit and is thereby bound by NVIDIA's own
+End User License Agreement.
+
+\section{Thrust}
+
+\field{License}{Apache License 2.0 (a limited number of utility classes are provided under the Boost Software License or a BSD license; see Thrust's own \texttt{LICENSE} file).}
+\field{Copyright}{No single copyright line is present; copyright notices are given within the license terms themselves rather than as a standalone header.}
+\field{Source}{\url{https://github.com/NVIDIA/thrust}, header-only, distributed as part of the CUDA Toolkit.}
+\field{Full license text}{\texttt{licenses/thrust.txt}}
+
+\noindent
+\textbf{Description:} Thrust is header-only and bundled with the CUDA
+Toolkit (located under \texttt{CUDA\_HOME/include}; it is neither fetched
+nor vendored separately). It is included directly in
+\texttt{src/kernels/cuda/sketch/countsketch\_cuda\_kernels.cu} and
+\texttt{src/kernels/cuda/sketch/gaussian\_sketch\_cuda\_kernels.cu}, and is
+compiled into \texttt{tomos\_cuda}. Unlike cuBLAS, cuSPARSE, and the other
+components listed above, which are dynamically linked and never
+incorporated into TOMOS's own binary, Thrust's template code is compiled
+directly into \texttt{tomos\_cuda}'s object code. For this reason it is
+listed as a separate entry rather than being subsumed under the
+proprietary CUDA Toolkit license: it is a distinct, Apache-licensed
+open-source component not covered by that End User License Agreement.
+Thrust does not ship a \texttt{NOTICE} file, so no additional material
+beyond the standard copyright and license text need be propagated.
+
+\section{OpenBLAS}
+
+\field{License}{BSD-3-Clause}
+\field{Copyright}{Copyright (c) 2011-2014, The OpenBLAS Project}
+\field{Source}{\url{https://github.com/OpenMathLib/OpenBLAS}, pinned at \texttt{v0.3.29}}
+\field{Full license text}{\texttt{licenses/openblas.txt}}
+
+\noindent
+\textbf{Description:} OpenBLAS is fetched automatically at configure time
+(\texttt{dependencies/CMakeLists.txt}, via CMake's \texttt{FetchContent}),
+built from source, and linked into the shipped \texttt{tomos\_core} and
+\texttt{tomos\_cpu} library binaries. It provides the CBLAS and LAPACKE
+routines used by \texttt{src/core/precond/sketch\_qr.cpp} and
+\texttt{src/kernels/cpu/dependencies/lapack.cpp}. This constitutes a
+genuine redistribution, as OpenBLAS's compiled code becomes part of the
+binaries that TOMOS ships.
+
+\section{CUTLASS}
+
+\field{License}{BSD-3-Clause}
+\field{Copyright}{Copyright (c) 2017 - 2026, NVIDIA CORPORATION \& AFFILIATES}
+\field{Source}{\url{https://github.com/NVIDIA/cutlass}}
+
+\noindent
+\textbf{Description:} CUTLASS is used in two distinct capacities. First, as
+an external benchmark comparison: a small number of standalone files under
+\texttt{benchmarks/kernels/cuda/matrix/} include CUTLASS headers directly
+and instantiate \texttt{cutlass::gemm::device::Gemm} to obtain a
+same-process throughput and correctness comparison. CUTLASS is not
+vendored in this repository for this purpose; it is fetched separately by
+whoever executes these scripts (via the \texttt{CUTLASS\_DIR} environment
+variable), and the resulting comparison executables are built independently
+of the \texttt{tomos\_core}, \texttt{tomos\_cpu}, and \texttt{tomos\_cuda}
+library targets. Second, as a reference during kernel tuning: over the
+course of a single GEMM kernel-tuning investigation confined to
+\texttt{src/kernels/cuda/matrix/mm\_cuda\_kernels.cu}, specific technical
+facts drawn from CUTLASS's source --- including a tile shape, a
+lane-to-coordinate mapping formula, a PTX instruction choice, and a
+pipeline-stage convention --- were used to inform the design of TOMOS's
+own, independently written kernels. Each instance enumerated below is
+already documented in the kernel file's own comments at the cited
+location; the list that follows serves as an index into that existing
+documentation rather than as new attribution text.
+
+\subsection*{Design decisions informed by reading CUTLASS source}
+
+\begin{enumerate}[leftmargin=*]
+
+\item \textbf{Lane-to-(row,col) mapping.}
+\textit{CUTLASS source cited:} \texttt{cutlass/layout/matrix.h},
+\texttt{RowMajorInterleaved<2>::inverse()}.
+\textit{Applied as:} a 2-line arithmetic formula replacing a plain
+divide/modulo split.
+\textit{Location:} \texttt{mm\_cuda\_kernels.cu:5378-5443}.
+
+\item \textbf{ldmatrix PTX variant + offset toggle.}
+\textit{CUTLASS source cited:}
+\texttt{cutlass::gemm::warp::MmaTensorOpMultiplicandTileIterator},
+\texttt{arch/memory\_sm75.h} --- via a standalone scratchpad that directly
+\texttt{\#include}s real CUTLASS as ground truth.
+\textit{Applied as:} swapped \texttt{.trans}$\to$non-transposed instruction,
+XOR offset fix.
+\textit{Location:} \texttt{mm\_cuda\_kernels.cu:15950-16229}.
+
+\item \textbf{Instruction scheduling/interleaving.}
+\textit{CUTLASS source cited:} \texttt{cuobjdump} SASS diff vs CUTLASS's
+compiled mainloop; also noted CUTLASS has no \texttt{\_\_launch\_bounds\_\_}.
+\textit{Applied as:} reordered load/compute source order; dropped a
+register ceiling.
+\textit{Location:} \texttt{mm\_cuda\_kernels.cu:1315-1346, 4242-4279,
+6025-6041, 6669-6684, 25001-25059, 28281-28331}.
+
+\item \textbf{Synchronous-load pipeline structure.}
+\textit{CUTLASS source cited:} \texttt{mma\_pipelined.h}'s
+\texttt{gemm\_iters}.
+\textit{Applied as:} rewrote pipeline to match (no cp.async).
+\textit{Location:} \texttt{mm\_cuda\_kernels.cu:1563-1586}.
+
+\item \textbf{Multistage priming/stage-count convention.}
+\textit{CUTLASS source cited:} \texttt{MmaMultistage}, confirmed
+\texttt{Stages=3} via \texttt{cuobjdump} on the built reference binary.
+\textit{Applied as:} wraparound-counter stage tracking; Stages=3 variants.
+\textit{Location:} \texttt{mm\_cuda\_kernels.cu:2025-2040, 15646-15663,
+20780-20818, 24542-24567, 30591-30695}.
+
+\item \textbf{Precomputed-stride pointer addressing.}
+\textit{CUTLASS source cited:} \texttt{PredicatedTileIterator};
+corroborated via register-count comparison.
+\textit{Applied as:} replaced per-tile IMAD address recompute, many
+kernels.
+\textit{Location:} \texttt{mm\_cuda\_kernels.cu:2242-2263, 2486-2514,
+2742-2746, 5595-5606, 19434-19485, 46109-46120, 46765-46778}.
+
+\item \textbf{Accumulator/warp-tile sizing.}
+\textit{CUTLASS source cited:} SASS diff: CUTLASS's 128-float/thread,
+square 64$\times$64 tile.
+\textit{Applied as:} BN changed 160$\to$128 for an exact match.
+\textit{Location:} \texttt{mm\_cuda\_kernels.cu:18105-18186}.
+
+\item \textbf{A-load thread$\to$address mapping (fixed an L2 bug).}
+\textit{CUTLASS source cited:} \texttt{PredicatedTileAccessIterator} +
+\texttt{cp\_async} --- wired up via real CUTLASS headers in a standalone
+repro.
+\textit{Applied as:} per-thread K/M mapping rewritten; fixed a confirmed
+1.5x L2-sector excess.
+\textit{Location:} \texttt{mm\_cuda\_kernels.cu:18414-18609}.
+
+\item \textbf{B-operand load mechanism.}
+\textit{CUTLASS source cited:} ``zero STS, both operands via cp.async''.
+\textit{Applied as:} converted B load to direct cp.async; $\sim$2x win.
+\textit{Location:} \texttt{mm\_cuda\_kernels.cu:18610-18648}.
+
+\item \textbf{A-layout swizzle formula.}
+\textit{CUTLASS source cited:} \texttt{tensor\_op\_multiplicand\_sm75.h}'s
+\texttt{TensorOpMultiplicand::operator()}.
+\textit{Applied as:} corrected an earlier self-invented, wrong swizzle.
+\textit{Location:} \texttt{mm\_cuda\_kernels.cu:23095-23167}.
+
+\item \textbf{Epilogue vectorization width.}
+\textit{CUTLASS source cited:} matching config's
+\texttt{LinearCombination<..., 128/sizeof\_bits<ElementC>>}.
+\textit{Applied as:} 8-half/float4 epilogue transfer.
+\textit{Location:} \texttt{mm\_cuda\_kernels.cu:19885-20377}.
+
+\item \textbf{Serpentine mma.sync accumulate order.}
+\textit{CUTLASS source cited:} \texttt{mma\_tensor\_op.h}'s
+\texttt{MmaTensorOp::operator()}.
+\textit{Applied as:} reordered 32 mma.sync calls; \texttt{.reuse}
+75\%$\to$97\%.
+\textit{Location:} \texttt{mm\_cuda\_kernels.cu:27785-27858}.
+
+\item \textbf{Full reference tile/warp/pipeline shape.}
+\textit{CUTLASS source cited:} \texttt{cutlass\_fp16\_gemm\_ref.cu}'s
+actual config (128$\times$256$\times$32 tile, 64$\times$64$\times$32 warp, 3
+stages).
+\textit{Applied as:} built from scratch together as one kernel.
+\textit{Location:} \texttt{mm\_cuda\_kernels.cu:16838-16945}.
+
+\item \textbf{B-swizzle (bigwarp family).}
+\textit{CUTLASS source cited:} \texttt{tensor\_op\_multiplicand\_sm75.h},
+\texttt{RowMajorTensorOpMultiplicandCongruous<16,64>}.
+\textit{Applied as:} XOR partition swizzle for B.
+\textit{Location:} \texttt{mm\_cuda\_kernels.cu:47478-47528}.
+
+\item \textbf{Warp-grid arrangement.}
+\textit{CUTLASS source cited:} CUTLASS's own
+\texttt{examples/14\_ampere\_tf32\_tensorop\_gemm}.
+\textit{Applied as:} 2$\times$2 warp grid, low-occupancy variant.
+\textit{Location:} \texttt{mm\_cuda\_kernels.cu:44714-44748}.
+
+\item \textbf{Register-level A/B double-buffering + spread cp.async
+issuance.}
+\textit{CUTLASS source cited:} \texttt{mma\_multistage.h} --- comment
+explicitly says ``read verbatim via curl''.
+\textit{Applied as:} ported into the ``bigwarp'' kernel family (one
+sub-piece reverted after \texttt{compute-sanitizer} found a data race).
+\textit{Location:} \texttt{mm\_cuda\_kernels.cu:44977-45404, 45530-45826,
+46109-46778, 47100-47898}.
+
+\item \textbf{Epilogue shared-memory staging.}
+\textit{CUTLASS source cited:}
+\texttt{epilogue/threadblock/epilogue.h}.
+\textit{Applied as:} stage C through shared memory before coalesced global
+write.
+\textit{Location:} \texttt{mm\_cuda\_kernels.cu:15111-15136}.
+
+\end{enumerate}
+
+None of the instances enumerated above incorporate CUTLASS's source text
+directly into TOMOS. In each case, a specific technical fact --- a formula,
+a configuration parameter, or an instruction choice --- was identified in
+CUTLASS's source and subsequently re-implemented in TOMOS's own,
+independently structured kernel code, using TOMOS's own naming
+conventions. Whether this practice constitutes the creation of a
+derivative work under copyright law is a legal determination that falls
+outside the scope of this document.
+
+The same source file contains a small number of additional references to
+``CUTLASS'' that invoke it as general design inspiration without citing a
+specific header, class, or formula (for example, a comment describing a
+``cutlass-style'' warp-tiling approach, or a reference to a ``real CUTLASS
+technique'' in connection with an experiment that was never incorporated
+into the shipped codebase). These references are omitted from the list
+above because they do not cite a specific source; documentation of them is
+available upon request.
+
+\section{Google Test (gtest)}
+
+\field{License}{BSD-3-Clause}
+\field{Copyright}{Copyright 2008, Google Inc.}
+\field{Source}{\url{https://github.com/google/googletest}, pinned at commit \texttt{03597a01ee50ed33e9dfd640b249b4be3799d395} (\texttt{test/CMakeLists.txt})}
+\field{Full license text}{\texttt{licenses/googletest.txt}}
+
+\noindent
+\textbf{Description:} Google Test is fetched automatically at configure
+time via CMake's \texttt{FetchContent}, built from source, and linked into
+every test executable under \texttt{test/} (\texttt{GTest::gtest\_main}).
+This is the same redistribution situation as OpenBLAS: gtest's compiled
+code becomes part of the shipped test binaries.
+
+\section{Google Benchmark}
+
+\field{License}{Apache License 2.0}
+\field{Copyright}{No single copyright line is present; the project's \texttt{AUTHORS} file attributes the work to multiple individual and organizational contributors, originally including Google Inc.}
+\field{Source}{\url{https://github.com/google/benchmark}, pinned at \texttt{v1.9.1} (\texttt{benchmarks/CMakeLists.txt})}
+\field{Full license text}{\texttt{licenses/google-benchmark.txt}}
+
+\noindent
+\textbf{Description:} Google Benchmark is fetched automatically at
+configure time via CMake's \texttt{FetchContent}, built from source, and
+linked into every \texttt{bench\_*} executable under \texttt{benchmarks/}
+(\texttt{benchmark::benchmark}). Apache License 2.0 differs from every
+other license family represented in this document in that it includes an
+explicit patent grant and a NOTICE-file-propagation clause (\S4(d));
+however, the google/benchmark project does not ship a \texttt{NOTICE}
+file, so no additional material beyond the standard copyright and license
+text need be propagated.
+
+\end{document}

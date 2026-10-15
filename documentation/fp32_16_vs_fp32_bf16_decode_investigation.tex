@@ -1,0 +1,129 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{amsmath}
+\usepackage{parskip}
+\usepackage{enumitem}
+
+\definecolor{codebg}{rgb}{0.95,0.95,0.95}
+\lstset{
+    basicstyle=\ttfamily\small,
+    backgroundcolor=\color{codebg},
+    breaklines=true,
+    frame=single,
+    columns=fullflexible,
+    language=C++,
+    showstringspaces=false,
+}
+
+\title{FP32\_16 vs.\ FP32\_BF16 GEMM (fp32-compute tier):\\Quantifying the Decode-Cost Gap}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\noindent
+\textbf{Kernels under study:} \texttt{mm\_fp32\_16\_tiled\_cpasync\_dualbuf\_kernel}, \texttt{mm\_fp32\_16\_tiled\_cpasync\_dualbuf\_truncated\_kernel}, \texttt{mm\_fp32\_bf16\_tiled\_cpasync\_dualbuf\_kernel}\\
+\textbf{Files:} \texttt{src/kernels/cuda/matrix/fp32\_16\_cuda\_kernels.cu}, \texttt{src/core/matrix/fp32\_16\_pack.hpp}\\
+\textbf{Hardware:} NVIDIA A100 (sm\_80), Purdue Gilbreth cluster\\
+\textbf{Benchmark:} \texttt{benchmarks/kernels/cuda/matrix/fp32\_recon\_vs\_cutlass\_ref.cu}, run via \texttt{scripts/benchmarks\_gemm\_format\_32\_16\_compute\_32.sh}
+
+\section{Background}
+
+Both \texttt{FP32\_16} and \texttt{FP32\_BF16} are packed 32-bit-value formats split into a 16-bit high word \texttt{wh} and a 16-bit low word \texttt{wr}, reconstructible to (near-)exact \texttt{fp32} for the \emph{accurate/reconstruction} compute tier. The two kernels compared here --- \texttt{mm\_fp32\_16\_tiled\_cpasync\_dualbuf} and \texttt{mm\_fp32\_bf16\_tiled\_cpasync\_dualbuf} --- are architecturally identical in every respect \emph{except} the decode step: same 128$\times$128 tile, same \texttt{BK=16}, same 2$\times$4-warp/8$\times$4-lane geometry, same dual-buffered \texttt{cp.async} pipelining of both operands, and the same compiled register footprint (127 registers, 0 spills, under \texttt{\_\_launch\_bounds\_\_(256,2)}). The only place they diverge is how each reconstructs an \texttt{fp32} value from \texttt{(wh, wr)}:
+
+\begin{lstlisting}
+// fp32_bf16: trivial, unconditional, exact by construction
+inline float fp32_bf16_combine(uint16_t wh, uint16_t wr) {
+    return bits_to_float((uint32_t(wh) << 16) | wr);
+}
+\end{lstlisting}
+
+\texttt{fp32\_16\_combine}, by contrast, must dispatch across three exponent-encoding modes (normal / extended / degraded, selected by a control bit and, within one branch, an offset field), unpack five separate bitfields (sign, control, \texttt{mant\_hi}, \texttt{mant\_lo}, \texttt{round\_flag}), and apply a rounding correction (\texttt{is\_carry}) when \texttt{wh}'s mantissa was rounded up during encoding and overflowed. This asymmetry was suspected to be the cause of a measured throughput gap between the two kernels; this document quantifies it with both real hardware measurements and static SASS analysis.
+
+A third kernel, \texttt{mm\_fp32\_16\_tiled\_cpasync\_dualbuf\_truncated}, was added specifically to separate the two possible causes: it reuses \texttt{fp32\_16\_split\_truncated}/\texttt{fp32\_16\_combine\_truncated} (plain truncation, no rounding, no \texttt{round\_flag}, no \texttt{is\_carry} correction) so its only structural difference from \texttt{fp32\_bf16\_combine} is the exponent-mode dispatch itself, with the rounding-correction cost removed entirely.
+
+\section{Measured Performance}
+
+Figures are from the most recent full square+rectangular sweep (\texttt{fp32\_recon\_vs\_cutlass\_ref\_20260823\_195101.txt/.csv}), all three kernels measured back-to-back in the same process on the same A100.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{rrrrr}
+\toprule
+N & FP32\_BF16 (GFlop/s) & FP32\_16, rounding & FP32\_16, truncated & rounding vs.\ BF16 \\
+\midrule
+1024   & 6{,}412.3  & 5{,}642.8  & 5{,}758.2  & $-$12.0\% \\
+2048   & 10{,}888.6 & 10{,}014.8 & 10{,}159.4 & $-$8.0\% \\
+4096   & 16{,}104.1 & 15{,}039.4 & 15{,}205.7 & $-$6.6\% \\
+8192   & 17{,}215.2 & 16{,}160.5 & 16{,}312.6 & $-$6.1\% \\
+16384  & 17{,}300.8 & 16{,}288.7 & 16{,}426.4 & $-$5.9\% \\
+32768  & 17{,}399.8 & 16{,}429.3 & 16{,}555.6 & $-$5.6\% \\
+49152  & 17{,}411.0 & 16{,}458.6 & 16{,}575.5 & $-$5.5\% \\
+\bottomrule
+\end{tabular}
+\caption{Square sweep ($M=K=N$). The gap narrows slightly with $N$ but never closes, settling around $-5.5$\% at steady state.}
+\end{table}
+
+The rectangular sweep ($M=N=49152$, $K$ = 1024--32768, same file) shows the identical pattern at every $K$: the rounding-decode kernel is consistently 5.5--6\% slower than \texttt{fp32\_bf16}, and the truncated-decode kernel recovers roughly one percentage point of that gap (e.g.\ at $K=32768$: 16{,}460.7 rounding vs.\ 16{,}576.4 truncated vs.\ 17{,}418.0 bf16 GFlop/s).
+
+\textbf{Conclusion from measurement alone:} removing the rounding correction entirely (rounding $\to$ truncated) buys back only $\sim$0.7--1.5 percentage points of throughput. The remaining $\sim$4.5--5 percentage point deficit versus \texttt{fp32\_bf16} persists even with rounding removed, so the bulk of the gap must come from the exponent-mode dispatch structure itself, not the rounding feature.
+
+\section{Static SASS Analysis}
+
+\texttt{cuobjdump --dump-sass} was run on the already-built \texttt{libtomos\_cuda.so} (static analysis only, no GPU execution) for all three kernels.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+Category & FP32\_BF16 & FP32\_16 truncated & FP32\_16 rounding & $\Delta$(trunc $\to$ round) \\
+\midrule
+Total instructions & 2{,}728 & 3{,}400 & 3{,}592 & $+$192 \\
+\texttt{BRA}   & 20  & 88  & 88  & $+$0 \\
+\texttt{SEL}   & 0   & 0   & 48  & $+$48 \\
+\texttt{ISETP} & 187 & 235 & 299 & $+$64 \\
+\texttt{LOP3}  & 11  & 256 & 273 & $+$17 \\
+\texttt{SHF}   & 39  & 189 & 159 & $-$30 \\
+\bottomrule
+\end{tabular}
+\caption{Instruction counts and category breakdown (whole compiled kernel), all three otherwise architecturally identical (same tile/warp/lane geometry, same 127--128 register count).}
+\end{table}
+
+Splitting the 864-instruction total gap (2728 $\to$ 3592) at the truncated kernel isolates two independent costs:
+
+\begin{itemize}
+\item \textbf{bf16 $\to$ truncated (+672 instructions): the exponent-mode format itself.} This is the cost of the 3-way normal/extended/degraded dispatch and unpacking five separate bitfields instead of one unconditional shift-or. It shows up almost entirely as \texttt{LOP3} ($+245$, the mask/shift/pack work for each field) and \texttt{SHF} ($+150$, extracting each field at its own bit offset) and \texttt{BRA} ($+68$, the real three-way branch). This cost is structural --- it cannot be removed without changing the format's bit layout, only its decode implementation.
+\item \textbf{truncated $\to$ rounding (+192 instructions): the \texttt{is\_carry} correction.} This lands almost entirely as \texttt{SEL} ($+48$) and \texttt{ISETP} ($+64$) --- confirming, again, that the correction compiles to predicated selects, never branches (\texttt{BRA} is unchanged, $+0$). This matches the small measured cost of removing it ($\sim$1 percentage point).
+\end{itemize}
+
+The small \texttt{SHF} decrease from truncated to rounding ($-30$) is not semantically meaningful; it reflects \texttt{ptxas} scheduling/instruction-selection variance once more registers and predicate opportunities are available, not a rounding-specific effect.
+
+\section{Prior Decode Optimization Attempts (Reverted)}
+
+Two attempts to reduce \texttt{fp32\_16\_combine}'s cost were tried and measured before the truncated-decode comparison above; both are documented in-place in \texttt{fp32\_16\_pack.hpp} so they are not silently re-attempted:
+
+\begin{enumerate}
+\item \textbf{Branchless swap} (avoiding warp divergence in \texttt{transform\_tile}'s decode call): $\sim$4--7\% \emph{slower}. The \texttt{is\_carry} branch is rare and well-predicted on this kernel's test data; paying its cost unconditionally on every element was a net loss.
+\item \textbf{Combined-integer/borrow-propagation decode} (a single subtract-with-borrow instead of the current hoisted-per-branch \texttt{is\_carry} selects): $\sim$1.2--2.3\% \emph{slower}, despite exhaustive correctness verification and \emph{fewer} static SASS instructions (\texttt{SEL} $48\to0$, \texttt{BRA} $202\to88$ in that experiment's build). The kept version's two \texttt{SEL}s both depend only on \texttt{is\_carry} and can plausibly dual-issue; the borrow-chain version likely has a longer serial dependency chain despite the lower instruction count.
+\end{enumerate}
+
+Both results reinforce the same lesson evident in this document: static instruction counts are directionally useful (as in Section~3, where they correctly attribute the two cost sources) but are not a substitute for on-hardware measurement when comparing implementations of comparable size --- dependency-chain length and scheduling can dominate raw instruction count.
+
+\section{Conclusion}
+
+The $\sim$5.5--6\% steady-state throughput gap between \texttt{mm\_fp32\_16\_tiled\_cpasync\_dualbuf} and \texttt{mm\_fp32\_bf16\_tiled\_cpasync\_dualbuf} is real, consistent across both square and rectangular sweeps, and almost entirely attributable to \texttt{FP32\_16}'s three-way exponent-mode decode format rather than to the more recently added rounding correction:
+
+\begin{itemize}
+\item $\sim$4.5--5 percentage points: the exponent-mode dispatch and five-bitfield unpack, structural to the \texttt{FP32\_16} wire format ($+672$ SASS instructions vs.\ \texttt{fp32\_bf16}).
+\item $\sim$0.7--1.5 percentage points: the \texttt{is\_carry} rounding correction ($+192$ SASS instructions on top of that).
+\end{itemize}
+
+Closing the remaining structural gap would require redesigning \texttt{FP32\_16}'s bit layout (e.g.\ eliminating the extended/degraded exponent modes), not further tuning the decode function --- both attempted decode-only optimizations (Section~4) already regressed performance despite reducing static instruction/branch counts.
+
+\end{document}

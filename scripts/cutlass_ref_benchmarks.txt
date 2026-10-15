@@ -1,0 +1,141 @@
+CUTLASS REFERENCE BENCHMARK SCRIPTS
+====================================
+
+This explains the four benchmark scripts that log their results to disk
+(a timestamped .txt console log plus a parsed .csv summary), under
+scripts/. All four:
+
+  - Build a standalone nvcc binary (not part of tomos's CMake build --
+    CUTLASS is not a dependency of the main project) from a .cu file in
+    benchmarks/kernels/cuda/matrix/, linking against the already-built
+    libtomos_cuda.so to call this codebase's own kernels directly.
+  - Auto-target the real A100: if not already running inside a SLURM job
+    allocation, the script finds your running job on an a100* partition
+    via squeue and re-execs itself inside it with `srun --overlap`, so
+    building and running always land on the actual GPU rather than
+    whatever (or no) GPU the login node itself has.
+  - Fetch CUTLASS (shallow clone, header-only) into
+    build/cutlass-ref on first run if it isn't there
+    already (override with the CUTLASS_DIR env var, or persistently via
+    a gitignored .configure.sh at the repo root -- see
+    .configure.sh.example).
+  - Rebuild tomos_cuda first, so results always reflect the current
+    state of the kernels, never a stale libtomos_cuda.so.
+  - Save every run's full console output to a timestamped .txt file, and
+    parse a per-shape summary (ms + GFlop/s for every method compared)
+    into a .csv, both under build/<script-name>_output/.
+
+There are two underlying benchmark programs, each with a "full sweep"
+script and a "rectangular-only" script that runs a subset of the same
+program's shapes:
+
+
+1. fp32_recon_vs_cutlass_ref.sh  (32-bit / fp32 compute)
+----------------------------------------------------------
+Builds and runs benchmarks/kernels/cuda/matrix/fp32_recon_vs_cutlass_
+ref.cu. Compares the "full reconstruction" tier of both packed-precision
+families -- kernels that decode BOTH halves of a packed value (wh and
+wr) and compute in real float, matching exact fp32 numerics:
+
+  - mm_fp32_16_tiled_cpasync_dualbuf   (FP32_16 packing, fp32 compute)
+  - mm_fp32_bf16_tiled_cpasync_dualbuf (FP32_BF16 packing, fp32 compute)
+
+...against this codebase's own best native (unpacked) fp32 GEMM
+(gemm_fp32_tiled_cpasync_dualbuf), real CUTLASS's fp32 SIMT device::Gemm,
+and cuBLAS's Sgemm.
+
+Usage:
+  scripts/fp32_recon_vs_cutlass_ref.sh
+      Square sweep: N=1024/2048/4096/8192/16384/32768/48000/54000
+      (M=K=N), then the rectangular sweep described below.
+  scripts/fp32_recon_vs_cutlass_ref.sh 8192
+      Just one square shape, M=K=N=8192.
+
+CSV columns: M, K, N, fp32_16_dualbuf_{ms,gflops},
+fp32_bf16_dualbuf_{ms,gflops}, native_{ms,gflops}, cutlass_{ms,gflops},
+cublas_{ms,gflops}.
+
+
+2. fp32_recon_rect_vs_cutlass_ref.sh  (32-bit / fp32 compute, rectangular only)
+---------------------------------------------------------------------------------
+Builds the SAME fp32_recon_vs_cutlass_ref.cu binary as script #1, but
+runs it with the --rect flag instead of the default no-arg mode, so only
+the rectangular sweep runs (skips the square N=1024..54000 sweep
+entirely). Useful when you only want these numbers without waiting
+through the rest.
+
+Rectangular sweep: output held fixed at M=N=44000, inner/contraction
+dimension K swept across 1024/2048/4096/8192/16384/32768 (2^10 through
+2^15) -- this stress-tests how each kernel's performance scales with K
+independent of output size, since every kernel compared here was
+originally tuned assuming M=K=N (square).
+
+Usage:
+  scripts/fp32_recon_rect_vs_cutlass_ref.sh
+      Sweeps K=1024/2048/4096/8192/16384/32768 at M=N=44000.
+  scripts/fp32_recon_rect_vs_cutlass_ref.sh 8192
+      Just M=N=44000, K=8192.
+
+Same CSV columns as script #1 (M/K/N will show M=44000, N=44000, and
+whichever K values ran).
+
+
+3. fp16_bf16_pure_vs_cutlass_ref.sh  (16-bit / fp16+bf16 compute)
+--------------------------------------------------------------------
+Builds and runs benchmarks/kernels/cuda/matrix/fp16_bf16_pure_vs_
+cutlass_ref.cu. Compares the "pure/composite" tier of both packed-
+precision families -- kernels that decode ONLY the high half (wh) of a
+packed value and compute via 16-bit tensor cores (wr is never touched):
+
+  - mm_fp32_16_pure_half_wide_bigreg_sq_inline_dirty
+    (FP32_16 packing, fp16 tensor-core compute -- documented in this
+    codebase as the fastest of its 7-kernel sibling group)
+  - mm_fp32_bf16_pure_bf16_wide_bigreg_sq_deep4
+    (FP32_BF16 packing, bf16 tensor-core compute)
+
+Each is compared against its own native (unpacked) kernel
+(gemm_fp16_mma_ptx_wide_bigreg_sq_deep4 / gemm_bf16_mma_ptx_wide_bigreg_
+sq_deep4), real CUTLASS's fp16/bf16 tensor-op device::Gemm, and cuBLAS
+(Hgemm for fp16, GemmEx with CUDA_R_16BF for bf16).
+
+Usage:
+  scripts/fp16_bf16_pure_vs_cutlass_ref.sh
+      Square sweep: N=1024/2048/4096/8192/16384/32768/65536 (M=K=N),
+      then the rectangular sweep described below.
+  scripts/fp16_bf16_pure_vs_cutlass_ref.sh 8192
+      Just one square shape, M=K=N=8192.
+
+CSV columns: M, K, N, pure_half_{ms,gflops}, native_fp16_{ms,gflops},
+cutlass_fp16_{ms,gflops}, cublas_fp16_{ms,gflops}, pure_bf16_{ms,gflops},
+native_bf16_{ms,gflops}, cutlass_bf16_{ms,gflops}, cublas_bf16_{ms,gflops}.
+
+
+4. fp16_bf16_pure_rect_vs_cutlass_ref.sh  (16-bit / fp16+bf16 compute, rectangular only)
+--------------------------------------------------------------------------------------------
+Builds the SAME fp16_bf16_pure_vs_cutlass_ref.cu binary as script #3,
+but runs it with the --rect flag, so only the rectangular sweep runs
+(skips the square N=1024..65536 sweep entirely).
+
+Rectangular sweep: same as script #2 -- M=N=44000, K swept across
+1024/2048/4096/8192/16384/32768 (2^10 through 2^15).
+
+Usage:
+  scripts/fp16_bf16_pure_rect_vs_cutlass_ref.sh
+      Sweeps K=1024/2048/4096/8192/16384/32768 at M=N=44000.
+  scripts/fp16_bf16_pure_rect_vs_cutlass_ref.sh 8192
+      Just M=N=44000, K=8192.
+
+Same CSV columns as script #3.
+
+
+NOTES
+-----
+- "SKIPPED" appears in place of a ms/gflops pair in the csv (and as a
+  console message) when a cudaMalloc for that specific buffer failed --
+  each method degrades independently rather than aborting the whole
+  shape, so a partial row is still useful.
+- All four scripts are safe to re-run repeatedly; each run gets its own
+  timestamped .txt/.csv pair, nothing is overwritten.
+- The .cu files rebuild against the CURRENT state of the kernels every
+  time (cmake --build tomos_cuda runs first), so results always reflect
+  whatever is in src/kernels/cuda/matrix/ at run time, not a stale build.
